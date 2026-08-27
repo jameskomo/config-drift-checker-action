@@ -2,7 +2,7 @@ name: sync-from-main
 # Keeps this Marketplace mirror in step with jameskomo/config-drift-checker:
 # when the main repo has a newer v*.*.* tag, rebuild action.yml + tools/ from it, commit, tag, release.
 on:
-  schedule: [{ cron: '23 */6 * * *' }]
+  schedule: [{ cron: '*/30 * * * *' }]
   workflow_dispatch:
 permissions: { contents: write }
 concurrency: { group: sync-from-main, cancel-in-progress: false }
