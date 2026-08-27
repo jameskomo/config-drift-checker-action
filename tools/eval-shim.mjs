@@ -98,7 +98,7 @@ for (const d of (await fs.readdir(evalDir, { withFileTypes: true })).filter((e) 
   let scaffoldScript = null;
   const casePath = path.join(evalDir, d.name, 'case.yaml');
   if (existsSync(casePath)) { const m = (await fs.readFile(casePath, 'utf8')).match(/scaffold_script:\s*\|\s*\n((?:[ \t]+.*\n?)+)/); if (m) scaffoldScript = m[1].replace(/^[ \t]+/gm, ''); }
-  cases.push({ scaffoldScript, dir: d.name, name: meta.name ?? d.name, tags: meta.tags ?? [], runs: opt.runs ?? meta.runs ?? 3, maxTurns: meta.max_turns ?? 10, timeout: (meta.timeout_seconds ?? 300) * 1000, allowedTools: meta.allowed_tools ?? [], model: opt.model ?? meta.model, prompt: body, graders });
+  cases.push({ scaffoldScript, description: meta.description ?? null, dir: d.name, name: meta.name ?? d.name, tags: meta.tags ?? [], runs: opt.runs ?? meta.runs ?? 3, maxTurns: meta.max_turns ?? 10, timeout: (meta.timeout_seconds ?? 300) * 1000, allowedTools: meta.allowed_tools ?? [], model: opt.model ?? meta.model, prompt: body, graders });
 }
 if (!cases.length) die('No eval cases found');
 function globToRe(g) { const alts = g.replace(/^\{(.*)\}$/, '$1').split(',').map((x) => x.trim()).filter(Boolean); return new RegExp('^(?:' + alts.map((a) => a.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*\*/g, '.*').replace(/\*/g, '[^/]*')).join('|') + ')$'); } // supports a,b and {a,b}
@@ -232,7 +232,12 @@ const regradeSource = opt.regrade ? JSON.parse(await fs.readFile(opt.regrade, 'u
 if (regradeSource && regradeSource.cases?.some((x) => x.arms?.without?.length)) opt.ablation = 'with-without';
 function fromSaved(r) {
   const toolUses = (r.toolUses ?? []).map((u) => ({ tool: u.tool, input: (() => { try { return JSON.parse(u.input); } catch { return u.input; } })() }));
-  return { lastMessage: r.response ?? '', finalMessage: r.response ?? '', texts: [r.response ?? ''], toolUses, files: r.filesChanged ?? [], fileContents: r.fileContents ?? {}, trace: [], costUsd: 0, inputTokens: r.inputTokens, outputTokens: r.outputTokens, numTurns: r.numTurns, isError: r.isError, timedOut: r.timedOut, durationMs: r.durationMs, stderr: '', model: r.model };
+  // Saved runs from older runner versions flagged max_turns exits as errors. A run that made tool calls and
+  // produced a response did real work: classify it as truncated (scored as-is), not errored.
+  const didWork = toolUses.length > 0 && !!(r.response && r.response.trim());
+  const isError = !!r.isError && !didWork && !r.truncated;
+  const truncated = !!r.truncated || (!!r.isError && didWork);
+  return { lastMessage: r.response ?? '', finalMessage: r.response ?? '', texts: [r.response ?? ''], toolUses, files: r.filesChanged ?? [], fileContents: r.fileContents ?? {}, trace: [], costUsd: 0, inputTokens: r.inputTokens, outputTokens: r.outputTokens, numTurns: r.numTurns, isError, truncated, resultSubtype: r.resultSubtype ?? (truncated ? 'error_max_turns (inferred)' : null), exitCode: r.exitCode ?? null, timedOut: r.timedOut, durationMs: r.durationMs, stderr: '', model: r.model };
 }
 
 // ---------- drive ----------
@@ -242,10 +247,10 @@ const stamp = new Date().toISOString().replace(/[:.]/g, '-');
 const outDir = opt.outputDir ?? path.join(evalDir, 'results', stamp);
 await fs.mkdir(outDir, { recursive: true });
 log(`eval-shim: ${pluginName} · ${cases.length} case(s) · arms=${arms.join(',')} · model=${opt.model} · judge=${opt.judgeModel}${opt.regrade ? ' · REGRADE of ' + path.basename(path.dirname(opt.regrade)) : ''}`);
-const report = { schemaVersion: '1', shim: true, generatedAt: new Date().toISOString(), regradeOf: opt.regrade ?? undefined, suite: { name: pluginName, caseCount: cases.length, baselineOnly: false }, cases: [], aggregates: {} };
+const report = { schemaVersion: '1', shim: true, generatedAt: opt.regrade ? (regradeSource?.generatedAt ?? new Date().toISOString()) : new Date().toISOString(), regradedAt: opt.regrade ? new Date().toISOString() : undefined, regradeOf: opt.regrade ?? undefined, suite: { name: pluginName, caseCount: cases.length, baselineOnly: false }, cases: [], aggregates: {} };
 let totalCost = 0, erroredRuns = 0, truncatedRuns = 0, firstError = null;
 for (const c of cases) {
-  const entry = { name: c.name, dir: c.dir, tags: c.tags, arms: {}, summary: {} };
+  const entry = { name: c.name, dir: c.dir, tags: c.tags, description: c.description, prompt: c.prompt, scaffold: c.scaffoldScript, graders: c.graders.map((g) => ({ name: g.name, type: g.type, rubric: g.rubric, target: g.target ?? null, pattern: g.pattern ?? null, match: g.match ?? null, tool: g.tool ?? null, input_match: g.input_match ?? null, min: g.min ?? null, max: g.max ?? null, path: g.path ?? null, criteria: g.criteria ?? null, arm: g.arm ?? null })), arms: {}, summary: {} };
   for (const arm of arms) {
     entry.arms[arm] = [];
     const saved = opt.regrade ? (regradeSource.cases.find((x) => (x.dir ?? x.name) === c.dir)?.arms?.[arm] ?? []) : null;
