@@ -1,0 +1,37 @@
+name: sync-from-main
+# Keeps this Marketplace mirror in step with jameskomo/config-drift-checker:
+# when the main repo has a newer v*.*.* tag, rebuild action.yml + tools/ from it, commit, tag, release.
+on:
+  schedule: [{ cron: '23 */6 * * *' }]
+  workflow_dispatch:
+permissions: { contents: write }
+concurrency: { group: sync-from-main, cancel-in-progress: false }
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with: { fetch-depth: 0 }
+      - id: versions
+        run: |
+          set -euo pipefail
+          latest=$(git ls-remote --tags --refs https://github.com/jameskomo/config-drift-checker.git 'v*.*.*' | awk -F/ '{print $NF}' | sort -V | tail -1)
+          mine=$(git tag -l 'v*.*.*' | sort -V | tail -1); mine=${mine:-v0.0.0}
+          echo "main=$latest mirror=$mine"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"; echo "mine=$mine" >> "$GITHUB_OUTPUT"
+          if [ "$(printf '%s\n%s\n' "$mine" "$latest" | sort -V | tail -1)" = "$latest" ] && [ "$latest" != "$mine" ]; then echo "update=true" >> "$GITHUB_OUTPUT"; else echo "update=false" >> "$GITHUB_OUTPUT"; fi
+      - if: steps.versions.outputs.update == 'true'
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          set -euo pipefail
+          v="${{ steps.versions.outputs.latest }}"
+          git clone -q --depth 1 --branch "$v" https://github.com/jameskomo/config-drift-checker.git /tmp/main
+          bash /tmp/main/scripts/build-action-mirror.sh "$GITHUB_WORKSPACE"
+          git -c user.name=config-drift-checker-bot -c user.email=config-drift-checker-bot@users.noreply.github.com add -A
+          git -c user.name=config-drift-checker-bot -c user.email=config-drift-checker-bot@users.noreply.github.com commit -qm "$v (synced from jameskomo/config-drift-checker)" || true
+          git push -q origin HEAD:main
+          git tag -f "$v" && git tag -f v0 && git push -q --force origin "$v" v0
+          gh release create "$v" --title "$v" --notes "Synced from https://github.com/jameskomo/config-drift-checker/releases/tag/$v" --latest || echo "release exists"
+          echo "released $v"
+      - if: steps.versions.outputs.update != 'true'
+        run: echo "mirror ${{ steps.versions.outputs.mine }} is up to date with main ${{ steps.versions.outputs.latest }}"
