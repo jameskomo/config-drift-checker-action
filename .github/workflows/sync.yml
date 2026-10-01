@@ -30,7 +30,8 @@ jobs:
           git -c user.name=config-drift-checker-bot -c user.email=config-drift-checker-bot@users.noreply.github.com add -A
           git -c user.name=config-drift-checker-bot -c user.email=config-drift-checker-bot@users.noreply.github.com commit -qm "$v (synced from jameskomo/config-drift-checker)" || true
           git push -q origin HEAD:main
-          git tag -f "$v" && git tag -f v0 && git push -q --force origin "$v" v0
+          major="${v%%.*}"
+          git tag -f "$v" && git tag -f v0 && git tag -f "$major" && git push -q --force origin "$v" v0 "$major"
           gh release create "$v" --title "$v" --notes "Synced from https://github.com/jameskomo/config-drift-checker/releases/tag/$v" --latest || echo "release exists"
           echo "released $v"
       - if: steps.versions.outputs.update != 'true'
