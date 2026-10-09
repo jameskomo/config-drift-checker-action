@@ -26,6 +26,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { loadMockRoots, loadMocks, declaredServers, planMocks } from './eval-mocks.mjs';
 
 // ---------- the official format (Claude Code 2.1.287) ----------
 export const PROMPT_KEYS = ['schema_version', 'name', 'description', 'tags', 'plugins', 'runs', 'expected_outcome', 'model', 'max_turns', 'timeout_seconds', 'allowed_tools', 'artifact_publish', 'growthbook_overrides', 'append_system_prompt', 'env'];
@@ -116,11 +117,12 @@ export function loadCase(evalDir, dir) {
   const graders = existsSync(gdir)
     ? readdirSync(gdir).filter((f) => f.endsWith('.md')).sort().map((f) => {
       const text = readFileSync(path.join(gdir, f), 'utf8');
-      return { file: `graders/${f}`, path: path.join(gdir, f), ...parseFrontmatter(text) };
+      const split = splitFrontmatter(text);
+      return { file: `graders/${f}`, path: path.join(gdir, f), hasFrontmatter: split.has, body: split.after.join('\n').trim(), ...parseFrontmatter(text) };
     })
     : [];
   return {
-    name: path.relative(evalDir, dir), dir,
+    name: path.relative(evalDir, dir), dir, evalDir,
     prompt: promptText === null ? null : { file: 'prompt.md', path: path.join(dir, 'prompt.md'), ...parseFrontmatter(promptText) },
     caseYaml: caseText === null ? null : { file: 'case.yaml', path: path.join(dir, 'case.yaml'), text: caseText, lines: caseText.split(/\r?\n/), entries: scanKeys(caseText.split(/\r?\n/)) },
     graders,
@@ -302,10 +304,25 @@ export const RULES = [
     fix: (c, f) => editFrontmatter(f.path, (fm, entries) => { const e = entries.find((x) => x.key === 'arm'); fm[e.start] = fm[e.start].replace(/^arm:([ \t]*)(['"]?)with\2/, 'arm:$1with-only'); return fm; }),
   },
   {
+    id: 'grader-prose-rubric',
+    level: 'ERROR',
+    description: 'a grader file needs YAML frontmatter with a type:; a prose rubric without it is not a grader to the runner (with no other graders the case fails with "graders: Required")',
+    detect: (c) => c.graders.filter((g) => !g.hasFrontmatter).map((g) => graderFinding(g, 'type',
+      `grader file has no frontmatter, so the runner does not count it as a grader${c.graders.every((x) => !x.hasFrontmatter) ? ' and the case has no graders ("graders: Required")' : ' and its rubric is never applied'}`,
+      g.body ? 'make it an llm grader: add frontmatter with type: llm and focus: last_message above the rubric, which becomes its criteria (the body)' : 'the file is empty: write the rubric with type: frontmatter, or delete it',
+      !!g.body)),
+    fix: (c, f) => {
+      const text = readFileSync(f.path, 'utf8');
+      if (splitFrontmatter(text).has) return;
+      const eol = text.includes('\r\n') ? '\r\n' : '\n';
+      writeFileSync(f.path, ['---', 'type: llm', 'focus: last_message', '---', ''].join(eol) + text.replace(/^(\s*\r?\n)+/, ''));
+    },
+  },
+  {
     id: 'grader-known-keys',
     level: 'ERROR',
     description: 'every grader key must be one the runner allows for its type (unknown keys fail the whole case)',
-    detect: (c) => c.graders.flatMap((g) => {
+    detect: (c) => c.graders.filter((g) => g.hasFrontmatter).flatMap((g) => {
       const type = g.meta.type;
       if (!type) return [graderFinding(g, 'type', 'grader has no type:', `add type: (one of ${Object.keys(GRADER_KEYS).join(', ')})`, false)];
       if (!GRADER_KEYS[type]) return [graderFinding(g, 'type', `unknown grader type ${type}`, `use one of ${Object.keys(GRADER_KEYS).join(', ')}`, false)];
@@ -347,11 +364,49 @@ export const RULES = [
       if (!existsSync(sidecar)) writeFileSync(sidecar, `# rule ids this case exercises (config-coverage.mjs --list prints valid ids)\n${items.length ? items.map((x) => `- ${x}`).join('\n') : '[]'}\n`);
     },
   },
+  {
+    id: 'mock-files',
+    level: 'ERROR',
+    description: 'MCP mock files (mocks/<server>/<tool>.md, _server.md, _tools.json) must use the keys, types and /regex/ dialect the runner accepts; a bad one stops the case loading',
+    detect: (c) => loadMockRoots([path.join(c.dir, 'mocks')], c.dir).problems.map((p) => mockFinding(p)),
+  },
+  {
+    id: 'mock-calls-needs-mocks',
+    level: 'WARN',
+    description: 'a mock_calls grader needs a mock that applies to its case; with none the runner fails the grader every time',
+    detect: (c) => {
+      const graders = c.graders.filter((g) => (g.meta.type === 'regex' && g.meta.target === 'mock_calls') || (g.meta.type === 'llm' && g.meta.focus === 'mock_calls'));
+      if (!graders.length) return [];
+      const { servers } = loadMocks(c.evalDir, c.dir);
+      if ([...servers.values()].some((s) => s.tools.size || s.server)) return [];
+      return graders.map((g) => graderFinding(g, g.meta.type === 'llm' ? 'focus' : 'target',
+        'grades mock_calls, but no mocks/<server>/<tool>.md applies to this case, so the runner fails it ("no mock stand-ins were active")',
+        'add evals/mocks/<server>/<tool>.md (or <case>/mocks/...) for the tools the case should call, or grade another target', false));
+    },
+  },
 ];
+const mockFinding = (p) => ({ file: p.file, path: null, key: p.key ?? null, message: p.message, fix: 'correct the mock file (see the mock file reference in the plugin-evals docs)', fixable: false, level: p.level });
+
+// Suite-wide mocks (<eval dir>/mocks/) are checked once, not once per case. A directory that matches none
+// of the plugin's MCP servers registers a standalone server, which the plugin's skills never call by name.
+export function diagnoseSuiteMocks(suite) {
+  const { servers, problems } = loadMocks(suite.evalDir, null);
+  const findings = problems.map((p) => ({ level: p.level, rule: 'mock-files', case: '(suite mocks)', source: 'static', ...mockFinding(p) }));
+  let name = null;
+  try { name = JSON.parse(readFileSync(path.join(suite.pluginDir, '.claude-plugin/plugin.json'), 'utf8')).name; } catch { /* no manifest */ }
+  const { servers: decl } = declaredServers(suite.pluginDir);
+  for (const p of planMocks(servers, name, decl).filter((x) => !x.shadow)) findings.push({ level: 'WARN', rule: 'mock-server-unknown', case: '(suite mocks)', source: 'static', file: `mocks/${p.dir}`, path: null, key: null,
+    message: `mocks/${p.dir}/ matches none of the plugin's MCP servers (${Object.keys(decl).join(', ') || 'it declares none'}), so it registers a standalone server whose tools are mcp__${p.dir}__<tool>`,
+    fix: `name the directory after a server in the plugin's MCP config${Object.keys(decl).length ? ` (${Object.keys(decl).join(', ')})` : ''}, or keep it if a standalone server is intended`, fixable: false });
+  return findings;
+}
 
 // ---------- static layer ----------
 export function diagnose(suite) {
-  return suite.cases.flatMap((c) => RULES.flatMap((r) => r.detect(c).map((f) => ({ level: r.level, rule: r.id, case: c.name, source: 'static', ...f }))));
+  return [
+    ...suite.cases.flatMap((c) => RULES.flatMap((r) => r.detect(c).map((f) => ({ level: r.level, rule: r.id, case: c.name, source: 'static', ...f })))),
+    ...diagnoseSuiteMocks(suite),
+  ];
 }
 
 // Apply every fixable finding, rule by rule, reloading each case after an edit. Returns what was fixed.
@@ -458,7 +513,9 @@ export function liveLoadCheck(suite, runnerPath, { timeoutMs = 180_000 } = {}) {
 export function mergeLive(findings, loadErrors) {
   const extra = [];
   for (const le of loadErrors) {
-    const hit = findings.find((f) => f.level === 'ERROR' && f.case === le.case && f.file === le.file && (!le.key || f.key === le.key));
+    const hit = findings.find((f) => f.level === 'ERROR' && f.case === le.case && f.file === le.file && (!le.key || f.key === le.key))
+      // "graders: Required" is how the runner sees a case whose grader files are all prose rubrics
+      ?? (le.key === 'graders' ? findings.find((f) => f.rule === 'grader-prose-rubric' && f.case === le.case) : undefined);
     if (hit) { hit.confirmedByRunner = true; hit.runnerMessage = le.message; continue; }
     extra.push({ level: 'ERROR', rule: 'runner-load', case: le.case, file: le.file, key: le.key, source: 'runner',
       message: `the runner refused this case: ${le.message}`, fix: 'no doctor rule covers this yet; fix it from the runner message', fixable: false });
